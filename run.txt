@@ -1,0 +1,22 @@
+
+
+python start.py bootstrap
+
+
+
+python start.py backend
+
+
+python start.py frontend
+
+
+python start.py ml server
+
+
+python start.py all
+
+
+run_federated.py 
+
+
+run_all.py

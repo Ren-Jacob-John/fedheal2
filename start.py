@@ -125,6 +125,7 @@ def main():
     boot_parser.add_argument("--password", default="demo-bootstrap-password-1")
 
     subparsers.add_parser("status", help="Check health and status of running services")
+    subparsers.add_parser("check", help="Check installed Python packages against requirements.txt")
     subparsers.add_parser("test", help="Run pytest test suite")
 
     if len(sys.argv) == 1:
@@ -144,6 +145,9 @@ def main():
         bootstrap_admin(args)
     elif args.command == "status":
         check_status()
+    elif args.command == "check":
+        import check_packages
+        check_packages.main()
     elif args.command == "test":
         run_tests()
     else:
