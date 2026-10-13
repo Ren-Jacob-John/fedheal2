@@ -1,0 +1,14 @@
+{
+  "name": "fedheal-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FedHeal Healthcare Federated Learning AI Platform (React + Python FastAPI)",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "preview:frontend": "npm --prefix frontend run preview",
+    "start:backend": "python backend/run_all.py",
+    "start:ml": "python ml/run_federated.py server"
+  }
+}

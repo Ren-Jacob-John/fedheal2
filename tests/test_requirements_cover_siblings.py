@@ -19,13 +19,13 @@ def names(path):
 
 
 def test_module8_requirements_cover_import_chain():
-    missing = REQUIRED_BY_IMPORT_CHAIN - names("module8-synthesis/requirements.txt")
-    assert not missing, f"module8-synthesis/requirements.txt is missing: {sorted(missing)}"
+    missing = REQUIRED_BY_IMPORT_CHAIN - names("backend/synthesis/requirements.txt")
+    assert not missing, f"backend/synthesis/requirements.txt is missing: {sorted(missing)}"
 
 
 def test_every_service_has_a_dockerfile_and_compose_entry():
     compose = (ROOT / "docker-compose.yml").read_text()
-    for module in ("module1-auth", "module2-validation", "module3-fedlearning",
-                   "module4-dashboard-react", "module7-admin", "module8-synthesis"):
+    for module in ("backend/auth", "backend/validation", "ml/federated",
+                   "frontend", "backend/admin", "backend/synthesis"):
         assert (ROOT / module / "Dockerfile").exists(), module
         assert f"{module}/Dockerfile" in compose, module

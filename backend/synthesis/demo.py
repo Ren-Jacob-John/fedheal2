@@ -11,8 +11,20 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "module6-condition-router"))
-sys.path.insert(0, str(Path(__file__).parent.parent / "module5-modelzoo"))
+for _p in [
+    Path(__file__).resolve().parents[2] / "ml" / "routing",
+    Path(__file__).resolve().parents[2] / "ml" / "models",
+    Path(__file__).parent.parent / "ml" / "routing",
+    Path(__file__).parent.parent / "ml" / "models",
+    Path(__file__).parent.parent / "module6-condition-router",
+    Path(__file__).parent.parent / "module5-modelzoo",
+    Path("/srv/ml/routing"),
+    Path("/srv/ml/models"),
+    Path("/srv/module6-condition-router"),
+    Path("/srv/module5-modelzoo"),
+]:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from condition_router import ConditionRouter, UnknownConditionError  # noqa: E402
 from conditions import resolve_condition  # noqa: E402

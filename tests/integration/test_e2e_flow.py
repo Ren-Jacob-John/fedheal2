@@ -88,17 +88,17 @@ def stack():
     m1_env = base_env(FEDHEAL_DB_BACKEND="local", FEDHEAL_LOCAL_STORE_PATH=f"{tmp}/auth_store.json",
                       FEDHEAL_VALIDATION_API_URL=f"http://127.0.0.1:{p2}")
     subprocess.run([sys.executable, "create_super_admin.py", "--email", "admin@e2e.fedheal.local"],
-                   cwd=ROOT / "module1-auth", env={**m1_env, "FEDHEAL_BOOTSTRAP_ADMIN_PASSWORD": ADMIN_PASSWORD},
+                   cwd=ROOT / "backend/auth", env={**m1_env, "FEDHEAL_BOOTSTRAP_ADMIN_PASSWORD": ADMIN_PASSWORD},
                    check=True, timeout=60, capture_output=True)
 
     services = {
-        "m1": Service("module1", "module1-auth", p1, m1_env, tmp),
-        "m2": Service("module2", "module2-validation", p2, base_env(FEDHEAL_ADMIN_API_URL="http://127.0.0.1:9"), tmp),
-        "m8": Service("module8", "module8-synthesis", p8,
+        "m1": Service("module1", "backend/auth", p1, m1_env, tmp),
+        "m2": Service("module2", "backend/validation", p2, base_env(FEDHEAL_ADMIN_API_URL="http://127.0.0.1:9"), tmp),
+        "m8": Service("module8", "backend/synthesis", p8,
                       base_env(FEDHEAL_AUTH_API_URL=f"http://127.0.0.1:{p1}", FEDHEAL_ALLOW_DEMO_MODEL="true",
                                FEDHEAL_ADMIN_API_URL="http://127.0.0.1:9"), tmp),
         # Same Module 8 with the demo fallback explicitly OFF: the vitals specialist has no model.
-        "m8_nomodel": Service("module8_nomodel", "module8-synthesis", p8b,
+        "m8_nomodel": Service("module8_nomodel", "backend/synthesis", p8b,
                               base_env(FEDHEAL_AUTH_API_URL=f"http://127.0.0.1:{p1}", FEDHEAL_ALLOW_DEMO_MODEL="false"), tmp),
     }
     try:

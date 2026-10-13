@@ -41,7 +41,7 @@ import pytest
 from test_doctor_workflow import VITALS, make_hospital_with_doctor
 from test_e2e_flow import ADMIN_PASSWORD, ROOT, Service, base_env, bearer, free_port, login
 
-M3 = ROOT / "module3-fedlearning"
+M3 = ROOT / "ml/federated"
 
 
 def _mint_scoped_token(hospital_id: str, audience: str, signing_key: str) -> str:
@@ -80,12 +80,12 @@ def fed():
     m1_env = base_env(FEDHEAL_DB_BACKEND="local", FEDHEAL_LOCAL_STORE_PATH=f"{tmp}/auth_store.json",
                       FEDHEAL_VALIDATION_API_URL=f"http://127.0.0.1:{p2}")
     subprocess.run([sys.executable, "create_super_admin.py", "--email", "admin@fed.fedheal.local"],
-                   cwd=ROOT / "module1-auth", env={**m1_env, "FEDHEAL_BOOTSTRAP_ADMIN_PASSWORD": ADMIN_PASSWORD},
+                   cwd=ROOT / "backend/auth", env={**m1_env, "FEDHEAL_BOOTSTRAP_ADMIN_PASSWORD": ADMIN_PASSWORD},
                    check=True, timeout=60, capture_output=True)
     services = {
-        "m1": Service("module1", "module1-auth", p1, m1_env, tmp),
-        "m2": Service("module2", "module2-validation", p2, base_env(FEDHEAL_ADMIN_API_URL=f"http://127.0.0.1:{p7}"), tmp),
-        "m7": Service("module7", "module7-admin", p7,
+        "m1": Service("module1", "backend/auth", p1, m1_env, tmp),
+        "m2": Service("module2", "backend/validation", p2, base_env(FEDHEAL_ADMIN_API_URL=f"http://127.0.0.1:{p7}"), tmp),
+        "m7": Service("module7", "backend/admin", p7,
                       base_env(FEDHEAL_DB_BACKEND="local", FEDHEAL_LOCAL_STORE_PATH=f"{tmp}/admin_store.json",
                                FEDHEAL_AUTH_API_URL=f"http://127.0.0.1:{p1}",
                                # TEST-ONLY relaxed gate (see module docstring)
@@ -93,7 +93,7 @@ def fed():
                                FEDHEAL_GATE_MAX_HOSPITAL_GAP="0.6", FEDHEAL_GATE_MIN_MARGIN_OVER_MAJORITY="0.0",
                                FEDHEAL_RETRAIN_MIN_ELIGIBLE_RECORDS="1"), tmp),
         # Demo fallback explicitly OFF: any answer must come from the promoted federated model.
-        "m8": Service("module8", "module8-synthesis", p8,
+        "m8": Service("module8", "backend/synthesis", p8,
                       base_env(FEDHEAL_AUTH_API_URL=f"http://127.0.0.1:{p1}", FEDHEAL_ADMIN_API_URL=f"http://127.0.0.1:{p7}",
                                FEDHEAL_ALLOW_DEMO_MODEL="false", FEDHEAL_PROMOTED_MODEL_CACHE_SECONDS="0"), tmp),
     }
@@ -258,14 +258,14 @@ def fed():
             server_log.close()
 
         def promoted_headers():
-            sys.path.insert(0, str(ROOT / "module8-synthesis"))
+            sys.path.insert(0, str(ROOT / "backend/synthesis"))
             try:
                 import importlib.util
-                spec = importlib.util.spec_from_file_location("fed_service_auth", ROOT / "module8-synthesis" / "service_auth.py")
+                spec = importlib.util.spec_from_file_location("fed_service_auth", ROOT / "backend/synthesis" / "service_auth.py")
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
             finally:
-                sys.path.remove(str(ROOT / "module8-synthesis"))
+                sys.path.remove(str(ROOT / "backend/synthesis"))
             return {"X-Service-Key": mod.mint_service_token("dev-only-signing-key-module8-to-module7", caller="module8",
                                                             audience=mod.AUD_PROMOTED_MODEL, hospital_id="*")}
         yield {"svc": services, "run": run, "tmp": tmp, "promoted_headers": promoted_headers,

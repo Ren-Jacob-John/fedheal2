@@ -11,11 +11,11 @@ import pathlib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 COPIES = {
-    "config.py": ["module1-auth", "module2-validation", "module3-fedlearning", "module7-admin", "module8-synthesis"],
-    "service_auth.py": ["module1-auth", "module2-validation", "module3-fedlearning", "module7-admin", "module8-synthesis"],
-    "audit.py": ["module1-auth", "module2-validation", "module7-admin", "module8-synthesis"],
-    "limits.py": ["module1-auth", "module2-validation"],
-    "docstore.py": ["module1-auth", "module7-admin"],
+    "config.py": ["backend/auth", "backend/validation", "ml/federated", "backend/admin", "backend/synthesis"],
+    "service_auth.py": ["backend/auth", "backend/validation", "ml/federated", "backend/admin", "backend/synthesis"],
+    "audit.py": ["backend/auth", "backend/validation", "backend/admin", "backend/synthesis"],
+    "limits.py": ["backend/auth", "backend/validation"],
+    "docstore.py": ["backend/auth", "backend/admin"],
 }
 
 

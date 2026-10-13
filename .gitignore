@@ -1,25 +1,84 @@
-# Local env files with real secrets — never commit these
-.env
-module1-auth/.env
-module2-validation/.env
-module7-admin/.env
-module8-synthesis/.env
+# ==============================================================================
+# FedHeal Git Ignore Configuration
+# ==============================================================================
 
-# Local development document stores (FEDHEAL_DB_BACKEND=local) and their lock/temp files
+# Environment files & Secrets (NEVER commit credentials)
+.env
+**/.env
+.env.*.local
+*.env.local
+firebase_pk.json
+
+# Local development document stores & locks
 *_store.json
 *_store.json.lock
 .store-*.tmp
-# Legacy SQLite files from before the Firestore migration
+backend/*_store.json*
 *.db
+*.sqlite
+*.sqlite3
 
-# Python
+# Python build, cache & bytecode
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Python Virtual Environments
 .venv/
 venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-# Node (if the frontend gets rebuilt in React/Next.js later)
+# Node & Frontend (React / Vite)
 node_modules/
-model_artifacts/
+frontend/node_modules/
+frontend/dist/
+dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-firebase_pk.json
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+test-results/
+playwright-report/
+
+# Machine Learning artifacts & checkpoints
+model_artifacts/
+checkpoints/
+
+# Logs
+*.log
+firebase-debug.log*
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo

@@ -41,7 +41,14 @@ import numpy as np
 import config
 from feature_mapper import VITALS_MAPPING, verify_mapping
 
-UCI_MODULE_PATH = Path(__file__).resolve().parent.parent / "module3-fedlearning" / "uci_heart.py"
+_candidate_uci_paths = [
+    Path(__file__).resolve().parents[2] / "ml" / "federated" / "uci_heart.py",
+    Path(__file__).resolve().parent.parent / "ml" / "federated" / "uci_heart.py",
+    Path(__file__).resolve().parent.parent / "module3-fedlearning" / "uci_heart.py",
+    Path("/srv/ml/federated/uci_heart.py"),
+    Path("/srv/module3-fedlearning/uci_heart.py"),
+]
+UCI_MODULE_PATH = next((_p for _p in _candidate_uci_paths if _p.exists()), _candidate_uci_paths[0])
 DEMO_MODEL_VERSION = "uci-cleveland-demo-1"
 
 

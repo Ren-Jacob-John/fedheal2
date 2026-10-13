@@ -10,16 +10,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN useradd --create-home --uid 10001 app
 
-WORKDIR /srv/module8-synthesis
+WORKDIR /srv/backend/synthesis
 
-COPY module8-synthesis/requirements.txt ./
+COPY backend/synthesis/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY module5-modelzoo/ /srv/module5-modelzoo/
-COPY module6-condition-router/ /srv/module6-condition-router/
-COPY module3-fedlearning/uci_heart.py /srv/module3-fedlearning/uci_heart.py
-COPY module3-fedlearning/datasets/ /srv/module3-fedlearning/datasets/
-COPY module8-synthesis/ ./
+COPY ml/models/ /srv/ml/models/
+COPY ml/routing/ /srv/ml/routing/
+COPY ml/federated/uci_heart.py /srv/ml/federated/uci_heart.py
+COPY ml/federated/datasets/ /srv/ml/federated/datasets/
+COPY backend/synthesis/ ./
 
 USER app
 

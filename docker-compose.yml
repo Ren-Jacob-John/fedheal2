@@ -30,9 +30,9 @@ services:
       retries: 20
       start_period: 10s
 
-  auth:            # Module 1
+  auth:            # Backend: Auth & Clinical Data Service (:8001)
     <<: *common
-    build: {context: ., dockerfile: module1-auth/Dockerfile}
+    build: {context: ., dockerfile: backend/auth/Dockerfile}
     environment:
       <<: *firestore-env
       FEDHEAL_VALIDATION_API_URL: http://validation:8002
@@ -47,9 +47,9 @@ services:
       retries: 20
       start_period: 15s
 
-  validation:      # Module 2
+  validation:      # Backend: Data Validation Service (:8002)
     <<: *common
-    build: {context: ., dockerfile: module2-validation/Dockerfile}
+    build: {context: ., dockerfile: backend/validation/Dockerfile}
     environment:
       FEDHEAL_ADMIN_API_URL: http://admin:8005
     ports: ["8002:8002"]
@@ -60,9 +60,9 @@ services:
       retries: 20
       start_period: 15s
 
-  admin:           # Module 7
+  admin:           # Backend: Admin & Model Registry Service (:8005)
     <<: *common
-    build: {context: ., dockerfile: module7-admin/Dockerfile}
+    build: {context: ., dockerfile: backend/admin/Dockerfile}
     environment:
       <<: *firestore-env
       FEDMED_AUTH_API_URL: http://auth:8001
@@ -77,9 +77,9 @@ services:
       retries: 20
       start_period: 15s
 
-  synthesis:       # Module 8 (Modules 5 and 6 are bundled into this image)
+  synthesis:       # Backend: Case Synthesis & Analysis Service (:8006)
     <<: *common
-    build: {context: ., dockerfile: module8-synthesis/Dockerfile}
+    build: {context: ., dockerfile: backend/synthesis/Dockerfile}
     environment:
       FEDHEAL_AUTH_API_URL: http://auth:8001
       FEDHEAL_ADMIN_API_URL: http://admin:8005     # where the PROMOTED model is read from
@@ -94,10 +94,10 @@ services:
       retries: 20
       start_period: 15s
 
-  fl-server:       # Module 3 Flower server; Compose uses plaintext by default (TLS options exist in M3)
+  fl-server:       # ML: Federated Learning Flower Server (:8080)
     <<: *common
     profiles: [federation]
-    build: {context: ., dockerfile: module3-fedlearning/Dockerfile}
+    build: {context: ., dockerfile: ml/federated/Dockerfile}
     depends_on:
       admin: {condition: service_healthy}
     ports: ["8080:8080"]
@@ -108,10 +108,10 @@ services:
       retries: 20
       start_period: 15s
 
-  dashboard:       # Module 4; VITE_* URLs are baked in at build time
+  dashboard:       # Frontend: React + Vite Dashboard (:5173)
     build:
       context: .
-      dockerfile: module4-dashboard-react/Dockerfile
+      dockerfile: frontend/Dockerfile
       args:
         VITE_AUTH_API_BASE: ${PUBLIC_AUTH_URL:-http://localhost:8001}
         VITE_ADMIN_API_BASE: ${PUBLIC_ADMIN_URL:-http://localhost:8005}

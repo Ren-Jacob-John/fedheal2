@@ -1,0 +1,33 @@
+# FedHeal Root Requirements
+# Consolidated dependencies to run backend services, ML pipelines, and test suites locally.
+
+# Web Framework & Server
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+python-multipart==0.0.9
+httpx==0.27.2
+
+# Security & Authentication
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.3.0
+python-dotenv==1.0.1
+
+# Database Backend (Local JSON store / Firestore)
+google-cloud-firestore==2.34.1
+
+# Data Science & Machine Learning
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+xgboost==3.3.0
+lightgbm==4.7.0
+shap==0.46.0
+tabpfn>=2.0
+
+# Federated Learning
+flwr==1.11.1
+
+# Testing
+pytest==8.3.3

@@ -103,33 +103,30 @@ Privacy details: [`docs/FEDERATED_PRIVACY.md`](docs/FEDERATED_PRIVACY.md).
 
 ## 4. Architecture
 
-Eight cooperating modules. Backend services use Python 3.12 / FastAPI, the dashboard is React (Vite), and
-federated learning uses Flower.
+Organized into a clean, intuitive full-stack structure:
 
 ```
-Browser (M4 React) ──JWT──► M1 auth/cases/vitals :8001 ──service token──► M2 validation :8002
-        │                         ▲
-        │                         └── hospital-scoped service token ── M3 federated learning (Flower :8080)
-        ├──JWT──► M7 admin / model registry :8005 ◄── candidates & round reports ── M3
-        └──JWT──► M8 synthesis / analysis :8006 ── reads promoted model from M7
-                         └─ uses M6 condition router ─► M5 model zoo
+Browser (React Frontend :5173) ──JWT──► Backend Auth/Cases/Vitals :8001 ──service token──► Backend Validation :8002
+        │                                             ▲
+        │                                             └── hospital-scoped service token ── ML Federated (Flower :8080)
+        ├──JWT──► Backend Admin/Registry :8005 ◄─────── candidates & round reports ─────── ML Federated
+        └──JWT──► Backend Synthesis/Analysis :8006 ─── reads promoted model from Admin
+                         └─ uses ML Routing ─────────► ML Specialist Models
 ```
 
-| # | Module | Purpose |
+| Folder | Subsystem | Purpose & Port |
 |---|---|---|
-| 1 | `module1-auth/` | Login, hospitals, hospital users, doctors, cases, history, vitals, scans, reviews, audit |
-| 2 | `module2-validation/` | 5-stage data validation gate |
-| 3 | `module3-fedlearning/` | Local training and FedAvg (simulation and networked Flower server/client) |
-| 4 | `module4-dashboard-react/` | Doctor, hospital-user and operator dashboard |
-| 5 | `module5-modelzoo/` | Specialist-model interface, registry, router (most specialists are labelled stubs) |
-| 6 | `module6-condition-router/` | Maps a condition to specialists and explainers (SHAP, Grad-CAM, knowledge graph) |
-| 7 | `module7-admin/` | Platform oversight, training rounds, model registry, validation gate, promotion, rollback |
-| 8 | `module8-synthesis/` | Builds the clinician review packet and runs `POST /cases/{id}/analyze` |
+| `frontend/` | React 18 + Vite | Clinician, hospital admin & operator dashboard (**Port 5173**) |
+| `backend/auth/` | FastAPI | Auth, hospital tenants, cases, vitals, history, scans (**Port 8001**) |
+| `backend/validation/` | FastAPI | 5-stage data validation & anomaly gate (**Port 8002**) |
+| `backend/admin/` | FastAPI | Platform oversight, model registry, validation gate & promotion (**Port 8005**) |
+| `backend/synthesis/` | FastAPI | Diagnostic synthesis packet & `POST /cases/{id}/analyze` (**Port 8006**) |
+| `backend/shared/` | Python library | Common utilities: `service_auth.py`, `audit.py`, `config.py`, `docstore.py` |
+| `ml/federated/` | Flower / Scikit-Learn | Federated training (FedAvg), Flower server (**Port 8080**), client runner, simulation |
+| `ml/models/` | ML Architectures | Specialist model zoo (TabPFN, XGBoost, Random Forest, stubs) |
+| `ml/routing/` | Explainability | Condition router, SHAP explainers, condition registry |
 
-Ports: M1 8001 · M2 8002 · M7 8005 · M8 8006 · Flower 8080 · dashboard 5173.
-
-More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API.md`](docs/API.md),
-[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md), [`docs/DATA_CONTRACT.md`](docs/DATA_CONTRACT.md).
+More detail: [`RUN_GUIDE.md`](RUN_GUIDE.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API.md`](docs/API.md).
 
 ---
 
@@ -137,60 +134,50 @@ More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API.md`](doc
 
 - Every analysis is `requires_clinician_review`. The system never states a confirmed diagnosis.
 - It does not output a treatment plan, medication or dose.
-- Every result shows the model version, status (`DEPLOYED`, or `FALLBACK` for the non-clinical demo model) and
-  whether it is federated.
+- Every result shows the model version, status (`DEPLOYED`, or `FALLBACK` for the non-clinical demo model) and whether it is federated.
 - Missing inputs are reported as missing. Nothing is silently filled in.
-- With no promoted model, analysis answers `MODEL_UNAVAILABLE`. The demo fallback only runs if
-  `FEDHEAL_ALLOW_DEMO_MODEL=true`, and is labelled **NON-CLINICAL DEMO MODEL**.
+- With no promoted model, analysis answers `MODEL_UNAVAILABLE`. The demo fallback only runs if `FEDHEAL_ALLOW_DEMO_MODEL=true`, and is labelled **NON-CLINICAL DEMO MODEL**.
 - A scan without a validated imaging model is reported as `UPLOADED — analysis UNAVAILABLE`.
 - Services refuse to start in production mode with missing or placeholder secrets.
 
 ---
 
-## 6. Running FedHeal locally
+## 6. Running FedHeal locally in Terminals (No Docker Required)
 
-### Prerequisites
+See the detailed [`RUN_GUIDE.md`](RUN_GUIDE.md) for full steps.
 
-- Python 3.11+ and Node.js 18+
-- No GPU is needed for the core demo. In development the services keep their data in a local JSON-file store (no database to install); staging/production use Firebase Firestore (see `docs/FIRESTORE_MIGRATION.md`).
-
-### Environment
-
-Copy `deploy/compose.env.example` to `.env` and fill the secrets
-(`python -c "import secrets; print(secrets.token_urlsafe(48))"`). These values must match across services:
-
-| Variable | Shared by | Purpose |
-|---|---|---|
-| `FEDHEAL_ENV` | all services | `development` for local work. **Unset = production**, which refuses weak config |
-| `FEDMED_JWT_SECRET` | M1, M7, M8 | M7 and M8 only verify tokens M1 issues |
-| `FEDHEAL_SVC_SIGNING_KEY_M3_M1` | M1; M3 operator | hospital-scoped training-data token |
-| `FEDHEAL_SVC_SIGNING_KEY_M1_M2` | M1, M2 | upload → validation token |
-| `FEDHEAL_SVC_SIGNING_KEY_M2_M7` | M2, M7 | validation flag reports |
-| `FEDHEAL_SVC_SIGNING_KEY_M3_M7` | M3, M7 | round reports and model candidates |
-| `FEDHEAL_SVC_SIGNING_KEY_M8_M7` | M8, M7 | reading the promoted model |
-| `FEDHEAL_DASHBOARD_ORIGIN` | M1, M7, M8 | must equal the dashboard origin (CORS) |
-| `FEDHEAL_ADMIN_API_URL` | M3, M8 | address of Module 7 |
-| `FEDHEAL_ALLOW_DEMO_MODEL` | M8 | leave **unset** to see the promoted model answer |
-
-### Start the stack
+### Quickstart
 
 ```bash
-python -m venv .venv && . .venv\Scripts\activate
-pip install -r module1-auth/requirements.txt -r module2-validation/requirements.txt \
-  -r module3-fedlearning/requirements.txt -r module6-condition-router/requirements.txt \
-  -r module7-admin/requirements.txt -r module8-synthesis/requirements.txt
+# 1. Setup virtual environment & dependencies
+python -m venv .venv && . .venv/Scripts/activate  # (on Windows) or: source .venv/bin/activate (macOS/Linux)
+pip install -r requirements.txt
 
-export FEDHEAL_ENV=development \
-  FEDHEAL_DASHBOARD_ORIGIN=http://localhost:5173 \
-  FEDHEAL_BOOTSTRAP_ADMIN_PASSWORD=demo-bootstrap-password-1
+# 2. Setup frontend
+cd frontend && npm install && cd ..
 
-(cd module1-auth && python create_super_admin.py --email admin@demo.local)
-(cd module1-auth && uvicorn main:app --port 8001) &
-(cd module2-validation && uvicorn main:app --port 8002) &
-(cd module7-admin && uvicorn main:app --port 8005) &
-(cd module8-synthesis && uvicorn main:app --port 8006) &
-(cd module4-dashboard-react && npm ci && npm run dev) &
+# 3. Create initial administrator
+python start.py bootstrap
+
+# 4. Start the stack in separate terminals:
+# Terminal 1 (Backend - all 4 microservices on :8001, :8002, :8005, :8006):
+python start.py backend
+# (Or on Windows: .\run-backend.ps1)
+
+# Terminal 2 (Frontend - React Vite on :5173):
+python start.py frontend
+# (Or on Windows: .\run-frontend.ps1)
+
+# Terminal 3 (Optional - ML Federated Learning Server on :8080):
+python start.py ml server
+# (Or on Windows: .\run-ml.ps1)
 ```
+
+You can also run both backend and frontend concurrently in one terminal:
+```bash
+python start.py all
+```
+
 
 ### Demo walkthrough
 

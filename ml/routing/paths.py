@@ -9,6 +9,9 @@ Every file in this module that needs a module5 class imports `paths` first.
 import os
 import sys
 
-_MODULE5_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "module5-modelzoo"))
-if _MODULE5_DIR not in sys.path:
-    sys.path.insert(0, _MODULE5_DIR)
+_MODELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models"))
+_LEGACY_MODULE5_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "module5-modelzoo"))
+
+for _dir in [_MODELS_DIR, _LEGACY_MODULE5_DIR]:
+    if os.path.exists(_dir) and _dir not in sys.path:
+        sys.path.insert(0, _dir)
