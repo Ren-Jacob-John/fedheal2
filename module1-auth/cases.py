@@ -1,0 +1,614 @@
+"""
+Patient cases, medical history, case-linked vitals, clinician review, and
+doctor management (P0).
+
+Built as a router factory so it reuses Module 1's existing dependencies
+(get_current_user / require_role / get_db) instead of re-implementing auth.
+
+Tenancy rules, enforced here and tested in test_cases.py:
+  * hospital_id is ALWAYS taken from the authenticated user, never from a
+    request body (a mismatching hospital_id in a doctor-create body is a 403).
+  * Clinical data (cases, history, vitals-by-case, reviews) is readable and
+    writable by CLINICIAN users of the owning hospital only. HOSPITAL_ADMIN
+    manages people, not patients; SUPER_ADMIN is platform-level and has no
+    access to patient-level data.
+  * A case that exists in another hospital answers 403 and is audited;
+    audit events carry ids only, never clinical content.
+"""
+import hashlib
+import logging
+import math
+import os
+import uuid
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Literal, Optional
+
+import httpx
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel, Field, field_validator
+
+import auth
+import models
+from audit import audit_event
+from repo import DuplicateError, Repo
+
+MAX_ITEMS = 50
+MAX_ITEM_CHARS = 200
+MAX_NOTE_CHARS = 2000
+
+
+def _short_list(v):
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        raise ValueError("must be a list of short strings")
+    if len(v) > MAX_ITEMS:
+        raise ValueError(f"at most {MAX_ITEMS} items")
+    out = []
+    for item in v:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("items must be non-empty strings")
+        if len(item) > MAX_ITEM_CHARS:
+            raise ValueError(f"items must be at most {MAX_ITEM_CHARS} characters")
+        out.append(item.strip())
+    return out
+
+
+class DoctorCreate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=10, max_length=200)
+    # Accepted only so a mismatch can be refused and audited; never used as the source of truth.
+    hospital_id: Optional[str] = None
+
+
+class DoctorOut(BaseModel):
+    id: str
+    hospital_id: str
+    full_name: Optional[str]
+    email: str
+    role: models.Role
+    is_active: bool
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class DoctorStatusUpdate(BaseModel):
+    is_active: bool
+
+
+class CaseCreate(BaseModel):
+    patient_ref: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    admission_reason: str = Field(min_length=1, max_length=500)
+    current_condition: Optional[str] = Field(default=None, max_length=64)
+    presenting_symptoms: list[str] = Field(default_factory=list)
+
+    @field_validator("presenting_symptoms")
+    @classmethod
+    def _sym(cls, v):
+        return _short_list(v)
+
+
+class CaseUpdate(BaseModel):
+    admission_reason: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    current_condition: Optional[str] = Field(default=None, max_length=64)
+    presenting_symptoms: Optional[list[str]] = None
+
+    @field_validator("presenting_symptoms")
+    @classmethod
+    def _sym(cls, v):
+        return None if v is None else _short_list(v)
+
+
+class CaseOut(BaseModel):
+    id: str
+    hospital_id: str
+    patient_ref: str
+    encounter_id: str
+    admission_reason: str
+    current_condition: Optional[str]
+    presenting_symptoms: list[str]
+    status: str
+    created_by: str
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class HistoryIn(BaseModel):
+    conditions: list[str] = Field(default_factory=list)
+    previous_diagnoses: list[str] = Field(default_factory=list)
+    surgeries: list[str] = Field(default_factory=list)
+    allergies: list[str] = Field(default_factory=list)
+    medications: list[str] = Field(default_factory=list)
+    family_history: list[str] = Field(default_factory=list)
+    previous_admissions: list[str] = Field(default_factory=list)
+    symptoms: list[str] = Field(default_factory=list)
+    notes: Optional[str] = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+    @field_validator("conditions", "previous_diagnoses", "surgeries", "allergies", "medications",
+                     "family_history", "previous_admissions", "symptoms")
+    @classmethod
+    def _lists(cls, v):
+        return _short_list(v)
+
+
+class HistoryOut(HistoryIn):
+    case_id: str
+    hospital_id: str
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CaseVitalsIn(BaseModel):
+    # One record. patient_ref and hospital are NOT accepted: they come from the case.
+    record: dict
+
+
+SCAN_TYPES = frozenset({"chest_xray", "ct_slice", "retina", "skin", "histology", "other"})
+MAX_SCAN_BYTES = int(os.environ.get("FEDHEAL_MAX_SCAN_BYTES", 5 * 1024 * 1024))
+# Content is identified from the bytes (magic numbers). Neither the filename nor the client's Content-Type is trusted.
+SCAN_SIGNATURES = (("image/png", b"\x89PNG\r\n\x1a\n", ".png"), ("image/jpeg", b"\xff\xd8\xff", ".jpg"))
+ALLOWED_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
+
+
+def upload_root() -> Path:
+    return Path(os.environ.get("FEDHEAL_UPLOAD_STORAGE_PATH", "./scan_uploads")).resolve()
+
+
+def sniff_image(data: bytes):
+    for ctype, magic, ext in SCAN_SIGNATURES:
+        if data.startswith(magic):
+            return ctype, ext
+    return None
+
+
+class ScanOut(BaseModel):
+    scan_id: str
+    case_id: str
+    hospital_id: str
+    scan_type: str
+    status: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    created_at: Optional[datetime]
+    analysis: str = "UNAVAILABLE: no validated imaging model exists in this release; the scan is stored and linked only."
+
+
+class ReviewIn(BaseModel):
+    decision: Literal["ACCEPTED", "OVERRIDDEN", "NEEDS_MORE_DATA"]
+    analysis_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    clinician_note: Optional[str] = Field(default=None, max_length=MAX_NOTE_CHARS)
+
+
+class AnalysisContributionIn(BaseModel):
+    feature: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+    value: Optional[float] = None
+    contribution: float
+
+    @field_validator("value", "contribution")
+    @classmethod
+    def _finite_numbers(cls, value):
+        if value is not None and not math.isfinite(value):
+            raise ValueError("must be finite")
+        return value
+
+    class Config:
+        extra = "forbid"
+
+
+class AnalysisConsiderationRefIn(BaseModel):
+    rule_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.-]+$")
+    version: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
+    source: str = Field(
+        min_length=1, max_length=256,
+        pattern=r"^(?:docs|module[0-9]+-[A-Za-z0-9_-]+)(?:/[A-Za-z0-9_.-]+)*(?:#[A-Za-z0-9_.-]+)?$",
+    )
+    validation_status: Literal["unvalidated - for clinician review"]
+
+    class Config:
+        extra = "forbid"
+
+
+class AnalysisOutputIn(BaseModel):
+    condition_key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    prediction_label: Literal["0", "1", "class 0", "class 1", "high_risk", "low_risk"]
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    requires_clinician_review: Literal[True] = True
+    contributions: list[AnalysisContributionIn] = Field(default_factory=list, max_length=32)
+    considerations: list[AnalysisConsiderationRefIn] = Field(default_factory=list, max_length=32)
+
+    class Config:
+        extra = "forbid"
+
+
+class AnalysisIn(BaseModel):
+    model_version: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    model_status: Literal["UNAVAILABLE", "STUB", "FALLBACK", "EXPERIMENTAL", "DEPLOYED", "CANDIDATE"]
+    artifact_hash: Optional[str] = Field(default=None, pattern=r"^[A-Fa-f0-9]{64}$")
+    inputs_used: list[str] = Field(default_factory=list, max_length=32)
+    missing_inputs: list[str] = Field(default_factory=list, max_length=32)
+    output: AnalysisOutputIn
+
+    @field_validator("inputs_used", "missing_inputs")
+    @classmethod
+    def _feature_identifiers_only(cls, values):
+        if any(not item or len(item) > 64 or not all(ch.isalnum() or ch in "_.:-" for ch in item)
+               for item in values):
+            raise ValueError("inputs must be short feature or modality identifiers")
+        return values
+
+    class Config:
+        extra = "forbid"
+
+
+class AnalysisOut(BaseModel):
+    analysis_id: str
+    hospital_id: str
+    case_id: str
+    model_version: str
+    model_status: str
+    artifact_hash: Optional[str]
+    inputs_used: list[str]
+    missing_inputs: list[str]
+    output: dict
+    created_by: str
+    created_at: Optional[datetime]
+
+
+class ReviewOut(BaseModel):
+    review_id: str
+    case_id: str
+    analysis_id: Optional[str]
+    doctor_id: str
+    hospital_id: str
+    decision: str
+    note: Optional[str]
+    created_at: Optional[datetime]
+
+
+def build_router(*, get_db, get_current_user, require_role, validation_api_url, mint_validation_token,
+                 stored_vitals_out, label_source, check_records, upload_limits, http_client_factory):
+    router = APIRouter()
+    admin_only = require_role(models.Role.HOSPITAL_ADMIN)
+    clinician_only = require_role(models.Role.CLINICIAN)
+
+    # ---------------- Doctor management (HOSPITAL_ADMIN) ----------------
+    @router.post("/hospital/doctors", response_model=DoctorOut, status_code=201)
+    def create_doctor(payload: DoctorCreate, request: Request, db: Repo = Depends(get_db),
+                      admin: models.User = Depends(admin_only)):
+        if not admin.hospital_id:
+            raise HTTPException(status_code=400, detail="Hospital admin has no hospital")
+        if payload.hospital_id is not None and payload.hospital_id != admin.hospital_id:
+            audit_event("cross_tenant.attempt", "denied", request=request, actor_user_id=admin.id,
+                        actor_role=admin.role, hospital_id=admin.hospital_id,
+                        requested_hospital_id=payload.hospital_id, resource_type="doctor")
+            raise HTTPException(status_code=403, detail="Cannot create a doctor for another hospital")
+        if db.get_user_by_email(payload.email):
+            raise HTTPException(status_code=400, detail="Email already registered")
+        doctor = models.User(
+            email=payload.email, full_name=payload.full_name,
+            hashed_password=auth.hash_password(payload.password),
+            role=models.Role.CLINICIAN, hospital_id=admin.hospital_id, is_active=True,
+        )
+        try:
+            db.create_user(doctor)
+        except DuplicateError:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        audit_event("doctor.create", "success", request=request, actor_user_id=admin.id,
+                    actor_role=admin.role, hospital_id=admin.hospital_id,
+                    target_user_id=doctor.id, target_role=doctor.role)
+        return doctor
+
+    @router.get("/hospital/doctors", response_model=list[DoctorOut])
+    def list_doctors(db: Repo = Depends(get_db), admin: models.User = Depends(admin_only)):
+        return db.list_doctors(admin.hospital_id)
+
+    @router.patch("/hospital/doctors/{doctor_id}", response_model=DoctorOut)
+    def set_doctor_status(doctor_id: str, payload: DoctorStatusUpdate, request: Request,
+                          db: Repo = Depends(get_db), admin: models.User = Depends(admin_only)):
+        doctor = db.get_user(doctor_id)
+        if doctor is None or doctor.role != models.Role.CLINICIAN:
+            raise HTTPException(status_code=404, detail="Doctor not found")
+        if doctor.hospital_id != admin.hospital_id:
+            audit_event("cross_tenant.attempt", "denied", request=request, actor_user_id=admin.id,
+                        actor_role=admin.role, hospital_id=admin.hospital_id,
+                        target_hospital_id=doctor.hospital_id, resource_type="doctor")
+            raise HTTPException(status_code=403, detail="Not permitted for this hospital's users")
+        doctor.is_active = payload.is_active
+        db.save_user(doctor)
+        audit_event("doctor.status", "success", request=request, actor_user_id=admin.id,
+                    actor_role=admin.role, hospital_id=admin.hospital_id,
+                    target_user_id=doctor.id, is_active=doctor.is_active)
+        return doctor
+
+    # ---------------- Case access helper ----------------
+    def _own_case(db: Repo, request: Request, user: models.User, case_id: str) -> models.Case:
+        case = db.get_case(case_id)
+        if case is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        if case.hospital_id != user.hospital_id:
+            audit_event("cross_tenant.attempt", "denied", request=request, actor_user_id=user.id,
+                        actor_role=user.role, hospital_id=user.hospital_id,
+                        target_hospital_id=case.hospital_id, case_id=case_id, resource_type="case")
+            raise HTTPException(status_code=403, detail="Not permitted for this hospital's cases")
+        return case
+
+    # ---------------- Cases ----------------
+    @router.post("/cases", response_model=CaseOut, status_code=201)
+    def create_case(payload: CaseCreate, request: Request, db: Repo = Depends(get_db),
+                    user: models.User = Depends(clinician_only)):
+        case = models.Case(
+            hospital_id=user.hospital_id, patient_ref=payload.patient_ref,
+            admission_reason=payload.admission_reason, current_condition=payload.current_condition,
+            presenting_symptoms=payload.presenting_symptoms, created_by=user.id,
+            status=models.CaseStatus.OPEN.value,
+        )
+        db.add_case(case)
+        audit_event("case.create", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, case_id=case.id, resource_type="case")
+        return case
+
+    @router.get("/cases", response_model=list[CaseOut])
+    def list_cases(request: Request, limit: int = 100, db: Repo = Depends(get_db),
+                   user: models.User = Depends(clinician_only)):
+        limit = max(1, min(limit, 500))
+        rows = db.list_cases(user.hospital_id, limit)
+        audit_event("case.list", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, count=len(rows), resource_type="case")
+        return rows
+
+    @router.get("/cases/{case_id}", response_model=CaseOut)
+    def get_case(case_id: str, request: Request, db: Repo = Depends(get_db),
+                 user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        audit_event("case.read", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, case_id=case.id, resource_type="case")
+        return case
+
+    @router.patch("/cases/{case_id}", response_model=CaseOut)
+    def update_case(case_id: str, payload: CaseUpdate, request: Request, db: Repo = Depends(get_db),
+                    user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        data = payload.model_dump(exclude_unset=True)
+        for k, v in data.items():
+            if k in ("admission_reason", "presenting_symptoms") and v is None:
+                continue
+            setattr(case, k, v)
+        db.save_case(case)
+        audit_event("case.update", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, case_id=case.id, resource_type="case")
+        return case
+
+    # ---------------- Medical history ----------------
+    @router.put("/cases/{case_id}/history", response_model=HistoryOut)
+    def put_history(case_id: str, payload: HistoryIn, request: Request, db: Repo = Depends(get_db),
+                    user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        row = db.get_history(case.id)
+        data = payload.model_dump()
+        if row is None:
+            row = models.MedicalHistory(case_id=case.id, hospital_id=case.hospital_id,
+                                        created_by=user.id, **data)
+        else:
+            for k, v in data.items():
+                setattr(row, k, v)
+        db.save_history(row)
+        audit_event("history.write", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, case_id=case.id, resource_type="medical_history")
+        return row
+
+    @router.get("/cases/{case_id}/history", response_model=HistoryOut)
+    def get_history(case_id: str, request: Request, db: Repo = Depends(get_db),
+                    user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        row = db.get_history(case.id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="No medical history recorded for this case")
+        audit_event("history.read", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, case_id=case.id, resource_type="medical_history")
+        return row
+
+    # ---------------- Case-linked vitals ----------------
+    @router.post("/cases/{case_id}/vitals")
+    async def add_case_vitals(case_id: str, payload: CaseVitalsIn, request: Request,
+                              db: Repo = Depends(get_db), user: models.User = Depends(clinician_only)):
+        """Single record, validated by Module 2 exactly like a bulk upload.
+        Rejected records are never stored and the reasons are returned."""
+        case = _own_case(db, request, user, case_id)
+        hospital = db.get_hospital(user.hospital_id)
+        raw = {k: v for k, v in payload.record.items() if k not in ("hospital_id",)}
+        raw["patient_ref"] = case.patient_ref            # the case decides the patient, not the body
+        check_records([raw], upload_limits)
+        try:
+            async with http_client_factory(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{validation_api_url}/validate/vitals",
+                    headers={"X-Service-Key": mint_validation_token(user.hospital_id)},
+                    json={"records": [raw], "hospital_id": user.hospital_id,
+                          "require_label": bool(hospital.requires_label) if hospital else False},
+                )
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Could not reach Module 2 (validation service): {e}")
+        result = resp.json()["results"][0]
+        if result["status"] not in ("passed", "flagged"):
+            audit_event("vitals.case_add", "denied", request=request, actor_user_id=user.id,
+                        actor_role=user.role, hospital_id=user.hospital_id, case_id=case.id,
+                        reason="validation_rejected")
+            raise HTTPException(status_code=422, detail={"status": result["status"],
+                                                         "reasons": result.get("reasons", [])})
+        record = models.VitalsRecord(
+            hospital_id=user.hospital_id, case_id=case.id, patient_ref=case.patient_ref,
+            age_years=raw["age_years"], height_cm=raw["height_cm"], weight_kg=raw["weight_kg"],
+            systolic_bp=raw.get("systolic_bp"), diastolic_bp=raw.get("diastolic_bp"),
+            heart_rate_bpm=raw.get("heart_rate_bpm"),
+            temperature_c=raw.get("temperature_c"), spo2_percent=raw.get("spo2_percent"),
+            respiratory_rate_bpm=raw.get("respiratory_rate_bpm"),
+            medication_count=raw.get("medication_count", 0),
+            medication_mg_total=raw.get("medication_mg_total", 0),
+            label=raw.get("label"), label_source=label_source(raw.get("label")),
+            validation_status=result["status"],
+        )
+        db.add_vitals(record)
+        audit_event("vitals.case_add", "success", request=request, actor_user_id=user.id,
+                    actor_role=user.role, hospital_id=user.hospital_id, case_id=case.id,
+                    record_id=record.id, status_code=200)
+        return {"record_id": record.id, "validation_status": result["status"],
+                "reasons": result.get("reasons", [])}
+
+    @router.get("/cases/{case_id}/vitals", response_model=list[stored_vitals_out])
+    def list_case_vitals(case_id: str, request: Request, db: Repo = Depends(get_db),
+                         user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        return db.list_case_vitals(case.id, user.hospital_id)
+
+    # ---------------- Scans (store + link only; analysis is explicitly unavailable) ----------------
+    @router.post("/cases/{case_id}/scans", response_model=ScanOut, status_code=201)
+    async def upload_scan(case_id: str, request: Request, scan_type: str = Form(...), file: UploadFile = File(...),
+                          db: Repo = Depends(get_db), user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_SCAN_BYTES + 64 * 1024:
+            audit_event("scan.upload", "denied", request=request, actor_user_id=user.id, actor_role=user.role,
+                        hospital_id=user.hospital_id, case_id=case.id, reason="too_large")
+            raise HTTPException(status_code=413, detail={"status": "INVALID_FILE", "message": "File is too large."})
+        deny = lambda reason, code, msg: (audit_event("scan.upload", "denied", request=request, actor_user_id=user.id,  # noqa: E731
+                                                       actor_role=user.role, hospital_id=user.hospital_id,
+                                                       case_id=case.id, reason=reason),
+                                          HTTPException(status_code=code, detail={"status": "INVALID_FILE", "message": msg}))[1]
+        if scan_type not in SCAN_TYPES:
+            raise deny("bad_scan_type", 422, f"scan_type must be one of {sorted(SCAN_TYPES)}")
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            raise deny("bad_extension", 422, "Only .png, .jpg and .jpeg files are accepted in this release.")
+        data = await file.read(MAX_SCAN_BYTES + 1)
+        if len(data) > MAX_SCAN_BYTES:
+            raise deny("too_large", 413, f"File exceeds the {MAX_SCAN_BYTES} byte limit.")
+        if not data:
+            raise deny("empty", 422, "The file is empty.")
+        sniffed = sniff_image(data)
+        if sniffed is None:
+            raise deny("bad_signature", 422, "The file content is not a PNG or JPEG image.")
+        ctype, canonical_ext = sniffed
+        if (file.content_type or "").lower() not in ("", "application/octet-stream", ctype):
+            raise deny("mime_mismatch", 422, "The declared MIME type does not match the file content.")
+        scan_id = str(uuid.uuid4())
+        rel = Path(user.hospital_id) / case.id / f"{scan_id}{canonical_ext}"      # server-generated; ids only
+        dest = (upload_root() / rel).resolve()
+        if upload_root() not in dest.parents:
+            raise deny("path_escape", 400, "Invalid storage path.")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        row = models.Scan(id=scan_id, case_id=case.id, hospital_id=user.hospital_id, scan_type=scan_type,
+                          file_reference=str(rel), content_type=ctype, size_bytes=len(data),
+                          sha256=hashlib.sha256(data).hexdigest(), status="UPLOADED", uploaded_by=user.id)
+        db.add_scan(row)
+        audit_event("scan.upload", "success", request=request, actor_user_id=user.id, actor_role=user.role,
+                    hospital_id=user.hospital_id, case_id=case.id, resource_type="scan", resource_id=row.id)
+        return ScanOut(scan_id=row.id, case_id=row.case_id, hospital_id=row.hospital_id, scan_type=row.scan_type,
+                       status=row.status, content_type=row.content_type, size_bytes=row.size_bytes,
+                       sha256=row.sha256, created_at=row.created_at)
+
+    @router.get("/cases/{case_id}/scans", response_model=list[ScanOut])
+    def list_scans(case_id: str, request: Request, db: Repo = Depends(get_db),
+                   user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        rows = db.list_scans(case.id, user.hospital_id)
+        return [ScanOut(scan_id=r.id, case_id=r.case_id, hospital_id=r.hospital_id, scan_type=r.scan_type,
+                        status=r.status, content_type=r.content_type, size_bytes=r.size_bytes, sha256=r.sha256,
+                        created_at=r.created_at) for r in rows]
+
+    # ---------------- AI analysis history ----------------
+    @router.post("/cases/{case_id}/analyses", response_model=AnalysisOut, status_code=201)
+    def create_analysis(case_id: str, payload: AnalysisIn, request: Request,
+                        db: Repo = Depends(get_db), user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        if payload.output.condition_key != case.current_condition:
+            raise HTTPException(status_code=422, detail="Analysis condition does not match this case")
+        analysis = models.AIAnalysis(
+            hospital_id=user.hospital_id,
+            case_id=case.id,
+            model_version=payload.model_version,
+            model_status=payload.model_status,
+            artifact_hash=payload.artifact_hash,
+            inputs_used=payload.inputs_used,
+            missing_inputs=payload.missing_inputs,
+            output=payload.output.model_dump(),
+            created_by=user.id,
+        )
+        db.add_analysis(analysis)
+        audit_event("analysis.create", "success", request=request, actor_user_id=user.id,
+                    actor_role=user.role, hospital_id=user.hospital_id, case_id=case.id,
+                    resource_type="ai_analysis", resource_id=analysis.id)
+        return AnalysisOut(
+            analysis_id=analysis.id, hospital_id=analysis.hospital_id, case_id=analysis.case_id,
+            model_version=analysis.model_version, model_status=analysis.model_status,
+            artifact_hash=analysis.artifact_hash, inputs_used=analysis.inputs_used,
+            missing_inputs=analysis.missing_inputs, output=analysis.output,
+            created_by=analysis.created_by, created_at=analysis.created_at,
+        )
+
+    @router.get("/cases/{case_id}/analyses", response_model=list[AnalysisOut])
+    def list_analyses(case_id: str, request: Request, db: Repo = Depends(get_db),
+                      user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        rows = db.list_analyses(case.id, user.hospital_id)
+        audit_event("analysis.list", "success", request=request, actor_user_id=user.id,
+                    actor_role=user.role, hospital_id=user.hospital_id, case_id=case.id,
+                    count=len(rows), resource_type="ai_analysis")
+        return [
+            AnalysisOut(
+                analysis_id=r.id, hospital_id=r.hospital_id, case_id=r.case_id,
+                model_version=r.model_version, model_status=r.model_status,
+                artifact_hash=r.artifact_hash, inputs_used=r.inputs_used,
+                missing_inputs=r.missing_inputs, output=r.output,
+                created_by=r.created_by, created_at=r.created_at,
+            )
+            for r in rows
+        ]
+
+    # ---------------- Clinician review ----------------
+    @router.post("/cases/{case_id}/review", response_model=ReviewOut, status_code=201)
+    def review_case(case_id: str, payload: ReviewIn, request: Request, db: Repo = Depends(get_db),
+                    user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        if payload.analysis_id is not None:
+            analysis = db.get_analysis(payload.analysis_id)
+            if analysis is None or analysis.case_id != case.id or analysis.hospital_id != user.hospital_id:
+                audit_event("cross_tenant.attempt", "denied", request=request, actor_user_id=user.id,
+                            actor_role=user.role, hospital_id=user.hospital_id,
+                            case_id=case.id, resource_type="ai_analysis", resource_id=payload.analysis_id)
+                raise HTTPException(status_code=403, detail="Analysis does not belong to this hospital case")
+        review = models.ClinicianReview(case_id=case.id, hospital_id=user.hospital_id, doctor_id=user.id,
+                                        decision=payload.decision, analysis_id=payload.analysis_id,
+                                        note=payload.clinician_note)
+        db.add_review(review, case, (models.CaseStatus.NEEDS_MORE_DATA.value if payload.decision == "NEEDS_MORE_DATA"
+                                     else models.CaseStatus.REVIEWED.value))
+        audit_event("clinician.review", "success", request=request, actor_user_id=user.id,
+                    actor_role=user.role, hospital_id=user.hospital_id, case_id=case.id,
+                    resource_type="review", resource_id=review.id, decision=payload.decision)
+        return ReviewOut(review_id=review.id, case_id=review.case_id, doctor_id=review.doctor_id,
+                         hospital_id=review.hospital_id, decision=review.decision,
+                         analysis_id=review.analysis_id, note=review.note,
+                         created_at=review.created_at)
+
+    @router.get("/cases/{case_id}/reviews", response_model=list[ReviewOut])
+    def list_reviews(case_id: str, request: Request, db: Repo = Depends(get_db),
+                     user: models.User = Depends(clinician_only)):
+        case = _own_case(db, request, user, case_id)
+        rows = db.list_reviews(case.id, user.hospital_id)
+        return [ReviewOut(review_id=r.id, case_id=r.case_id, doctor_id=r.doctor_id,
+                          hospital_id=r.hospital_id, decision=r.decision,
+                          analysis_id=r.analysis_id, note=r.note,
+                          created_at=r.created_at) for r in rows]
+
+    return router

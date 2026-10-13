@@ -1,0 +1,22 @@
+{
+  "name": "fedheal-federation-map",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Spatial, real-time UI for FedHeal — a federation map of hospitals orbiting the shared model, wired to Module 1 (auth) and Module 7 (admin/platform).",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.0",
+    "@vitejs/plugin-react": "^6.1.0",
+    "vite": "^8.2.1"
+  }
+}
